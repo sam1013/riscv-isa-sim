@@ -83,7 +83,7 @@ class debug_module_t : public abstract_device_t
      * 2. Write the value that was read back, plus one, to authdata.
      */
     debug_module_t(sim_t *sim, unsigned progbufsize, unsigned max_bus_master_bits,
-        bool require_authentication);
+        bool require_authentication, bool support_abstract_csr_access);
     ~debug_module_t();
 
     void add_device(bus_t *bus);
@@ -110,6 +110,7 @@ class debug_module_t : public abstract_device_t
     unsigned program_buffer_bytes;
     unsigned max_bus_master_bits;
     bool require_authentication;
+    bool support_abstract_csr_access;
     static const unsigned debug_data_start = 0x380;
     unsigned debug_progbuf_start;
 
