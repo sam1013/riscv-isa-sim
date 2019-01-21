@@ -1,3 +1,4 @@
+p->update_insnhistogram(&dummy_stall);
 switch (STATE.prv)
 {
   case PRV_U: throw trap_user_ecall();

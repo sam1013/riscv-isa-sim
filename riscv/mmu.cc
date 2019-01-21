@@ -1,10 +1,13 @@
 // See LICENSE for license details.
 
 #include "mmu.h"
+#include "pmp.h"
+#include "tag.h"
 #include "sim.h"
 #include "processor.h"
+#include <assert.h>
 
-mmu_t::mmu_t(sim_t* sim, processor_t* proc)
+mmu_t::mmu_t(sim_t* sim, processor_t* proc, size_t tag_width)
  : sim(sim), proc(proc),
   check_triggers_fetch(false),
   check_triggers_load(false),
@@ -12,10 +15,19 @@ mmu_t::mmu_t(sim_t* sim, processor_t* proc)
   matched_trigger(NULL)
 {
   flush_tlb();
+  tag = new tag_t(proc, tag_width);
 }
 
 mmu_t::~mmu_t()
 {
+  delete tag;
+}
+
+void mmu_t::reset()
+{
+  if (tag) {
+    tag->reset();
+  }
 }
 
 void mmu_t::flush_icache()
@@ -47,9 +59,50 @@ reg_t mmu_t::translate(reg_t addr, access_type type)
   return walk(addr, type, mode) | (addr & (PGSIZE-1));
 }
 
+/*
+ * Check if access satisfies pmp policies
+ * - M-mode can bypass check
+ * return true if access is valid
+ */
+bool mmu_t::check_pmp(reg_t addr, reg_t len, access_type type)
+{
+  if (!proc || !proc->get_pmp()->isactive())
+    return true;
+
+  reg_t priv = proc->state.prv;
+  security_type_t stype = proc->state.sec_level;
+  
+  if (type != FETCH) {
+       //todo: is dcsr.cause interesting here?
+    if (!proc->state.dcsr.cause && get_field(proc->state.mstatus, MSTATUS_MPRV))
+      priv = get_field(proc->state.mstatus, MSTATUS_MPP);
+  }
+  if (priv == PRV_M) {
+    /* Machine mode bypasses MMU checks */
+    return true;
+  }
+  
+  return proc->get_pmp()->check(addr, len, type, priv, stype);
+}
+
 tlb_entry_t mmu_t::fetch_slow_path(reg_t vaddr)
 {
   reg_t paddr = translate(vaddr, FETCH);
+
+  /* Check tags and do optional modeswitch */
+  if (!tag->tagcheck(paddr, FETCH))
+    throw trap_tag_mismatch(vaddr);
+
+  /* We need to apply MPU check *after* modeswitch because modeswitch
+   * changes MPU check semantics. */
+  /* Fetch to next aligned address */
+  const reg_t alignment = 4;
+  reg_t paligned = (paddr & ~(alignment-1)) + alignment;
+  reg_t len = paligned - paddr; 
+  if(!check_pmp(paddr, len, FETCH)) {// TODO: use correct length
+    debug_warn("PMP fetch violation @ %p!\n", (void*)proc->get_state()->pc);
+    throw trap_instruction_access_fault(vaddr);
+  }
 
   if (auto host_addr = sim->addr_to_mem(paddr)) {
     return refill_tlb(vaddr, paddr, host_addr, FETCH);
@@ -87,9 +140,17 @@ reg_t reg_from_bytes(size_t len, const uint8_t* bytes)
   abort();
 }
 
-void mmu_t::load_slow_path(reg_t addr, reg_t len, uint8_t* bytes)
+void mmu_t::load_slow_path(reg_t addr, reg_t len, uint8_t* bytes, bool tagcheck)
 {
   reg_t paddr = translate(addr, LOAD);
+
+  if(!check_pmp(paddr, len, LOAD)) {
+    debug_warn("PMP load access violation @ %p accessing %p!\n", (void*)proc->get_state()->pc, (void*)paddr);
+    throw trap_load_access_fault(addr);
+  }
+
+  if (tagcheck && !tag->tagcheck(paddr, LOAD))
+    throw trap_tag_mismatch(addr);
 
   if (auto host_addr = sim->addr_to_mem(paddr)) {
     memcpy(bytes, host_addr, len);
@@ -98,6 +159,7 @@ void mmu_t::load_slow_path(reg_t addr, reg_t len, uint8_t* bytes)
     else
       refill_tlb(addr, paddr, host_addr, LOAD);
   } else if (!sim->mmio_load(paddr, len, bytes)) {
+    debug_warn("MMIO load fault @ %p accessing %p!\n", (void*)proc->get_state()->pc, (void*)paddr);
     throw trap_load_access_fault(addr);
   }
 
@@ -112,6 +174,14 @@ void mmu_t::load_slow_path(reg_t addr, reg_t len, uint8_t* bytes)
 void mmu_t::store_slow_path(reg_t addr, reg_t len, const uint8_t* bytes)
 {
   reg_t paddr = translate(addr, STORE);
+
+  if(!check_pmp(paddr, len, STORE)) {
+    debug_warn("PMP store access violation @ %p accessing %p!\n", (void*)proc->get_state()->pc, (void*)paddr);
+    throw trap_store_access_fault(addr);
+  }
+
+  if (!tag->tagcheck(paddr, STORE))
+    throw trap_tag_mismatch(addr);
 
   if (!matched_trigger) {
     reg_t data = reg_from_bytes(len, bytes);
@@ -181,8 +251,10 @@ reg_t mmu_t::walk(reg_t addr, access_type type, reg_t mode)
 
     // check that physical address of PTE is legal
     auto ppte = sim->addr_to_mem(base + idx * vm.ptesize);
-    if (!ppte)
+    if (!ppte) {
+      debug_warn("Invalid PTE @ %p!\n", (void*)proc->get_state()->pc);
       throw trap_load_access_fault(addr);
+    }
 
     reg_t pte = vm.ptesize == 4 ? *(uint32_t*)ppte : *(uint64_t*)ppte;
     reg_t ppn = pte >> PTE_PPN_SHIFT;

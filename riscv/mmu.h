@@ -10,8 +10,12 @@
 #include "sim.h"
 #include "processor.h"
 #include "memtracer.h"
+#include "debugprint.h"
 #include <stdlib.h>
-#include <vector>
+#include <assert.h>
+
+class pmp_t;
+class tag_t;
 
 // virtual memory configuration
 #define PGSHIFT 12
@@ -53,8 +57,9 @@ class trigger_matched_t
 class mmu_t
 {
 public:
-  mmu_t(sim_t* sim, processor_t* proc);
+  mmu_t(sim_t* sim, processor_t* proc, size_t tag_width);
   ~mmu_t();
+  void reset();
 
   inline reg_t misaligned_load(reg_t addr, size_t size)
   {
@@ -83,20 +88,9 @@ public:
     inline type##_t load_##type(reg_t addr) { \
       if (unlikely(addr & (sizeof(type##_t)-1))) \
         return misaligned_load(addr, sizeof(type##_t)); \
-      reg_t vpn = addr >> PGSHIFT; \
-      if (likely(tlb_load_tag[vpn % TLB_ENTRIES] == vpn)) \
-        return *(type##_t*)(tlb_data[vpn % TLB_ENTRIES].host_offset + addr); \
-      if (unlikely(tlb_load_tag[vpn % TLB_ENTRIES] == (vpn | TLB_CHECK_TRIGGERS))) { \
-        type##_t data = *(type##_t*)(tlb_data[vpn % TLB_ENTRIES].host_offset + addr); \
-        if (!matched_trigger) { \
-          matched_trigger = trigger_exception(OPERATION_LOAD, addr, data); \
-          if (matched_trigger) \
-            throw *matched_trigger; \
-        } \
-        return data; \
-      } \
+      /* always use slow path */ \
       type##_t res; \
-      load_slow_path(addr, sizeof(type##_t), (uint8_t*)&res); \
+      load_slow_path(addr, sizeof(type##_t), (uint8_t*)&res, true); \
       return res; \
     }
 
@@ -117,19 +111,8 @@ public:
     void store_##type(reg_t addr, type##_t val) { \
       if (unlikely(addr & (sizeof(type##_t)-1))) \
         return misaligned_store(addr, val, sizeof(type##_t)); \
-      reg_t vpn = addr >> PGSHIFT; \
-      if (likely(tlb_store_tag[vpn % TLB_ENTRIES] == vpn)) \
-        *(type##_t*)(tlb_data[vpn % TLB_ENTRIES].host_offset + addr) = val; \
-      else if (unlikely(tlb_store_tag[vpn % TLB_ENTRIES] == (vpn | TLB_CHECK_TRIGGERS))) { \
-        if (!matched_trigger) { \
-          matched_trigger = trigger_exception(OPERATION_STORE, addr, val); \
-          if (matched_trigger) \
-            throw *matched_trigger; \
-        } \
-        *(type##_t*)(tlb_data[vpn % TLB_ENTRIES].host_offset + addr) = val; \
-      } \
-      else \
-        store_slow_path(addr, sizeof(type##_t), (const uint8_t*)&val); \
+      /* always use slow path */ \
+      store_slow_path(addr, sizeof(type##_t), (const uint8_t*)&val); \
     }
 
   // template for functions that perform an atomic memory operation
@@ -237,10 +220,13 @@ public:
   void flush_icache();
 
   void register_memtracer(memtracer_t*);
+  bool check_pmp(reg_t addr, reg_t len, access_type type);
+  tag_t* get_tag() { return tag; }
 
 private:
   sim_t* sim;
   processor_t* proc;
+  tag_t* tag;
   memtracer_list_t tracer;
   uint16_t fetch_temp;
 
@@ -266,12 +252,13 @@ private:
 
   // handle uncommon cases: TLB misses, page faults, MMIO
   tlb_entry_t fetch_slow_path(reg_t addr);
-  void load_slow_path(reg_t addr, reg_t len, uint8_t* bytes);
+  void load_slow_path(reg_t addr, reg_t len, uint8_t* bytes, bool tagcheck);
   void store_slow_path(reg_t addr, reg_t len, const uint8_t* bytes);
   reg_t translate(reg_t addr, access_type type);
 
   // ITLB lookup
   inline tlb_entry_t translate_insn_addr(reg_t addr) {
+    /*
     reg_t vpn = addr >> PGSHIFT;
     if (likely(tlb_insn_tag[vpn % TLB_ENTRIES] == vpn))
       return tlb_data[vpn % TLB_ENTRIES];
@@ -282,6 +269,8 @@ private:
         throw trigger_matched_t(match, OPERATION_EXECUTE, addr, *ptr);
       return tlb_data[vpn % TLB_ENTRIES];
     }
+    */
+    /* always use slow path */
     return fetch_slow_path(addr);
   }
 
@@ -311,6 +300,7 @@ private:
   trigger_matched_t *matched_trigger;
 
   friend class processor_t;
+  friend class pmp_t;
 };
 
 struct vm_info {

@@ -5,6 +5,7 @@
 #include "remote_bitbang.h"
 #include "cachesim.h"
 #include "extension.h"
+#include "debugprint.h"
 #include <dlfcn.h>
 #include <fesvr/option_parser.h>
 #include <stdio.h>
@@ -21,7 +22,9 @@ static void help()
   fprintf(stderr, "  -m<n>                 Provide <n> MiB of target memory [default 2048]\n");
   fprintf(stderr, "  -m<a:m,b:n,...>       Provide memory regions of size m and n bytes\n");
   fprintf(stderr, "                          at base addresses a and b (with 4 KiB alignment)\n");
+  fprintf(stderr, "  -t<n>                 Provide <n> bits for every memory tag [1-64, default 2]\n");
   fprintf(stderr, "  -d                    Interactive debug mode\n");
+  fprintf(stderr, "  -D<l>                 Print debug messages of level <l>\n");
   fprintf(stderr, "  -g                    Track histogram of PCs\n");
   fprintf(stderr, "  -l                    Generate a log of execution\n");
   fprintf(stderr, "  -h                    Print this help message\n");
@@ -72,6 +75,7 @@ static std::vector<std::pair<reg_t, mem_t*>> make_mems(const char* arg)
 int main(int argc, char** argv)
 {
   bool debug = false;
+  int debug_level = 0;
   bool halted = false;
   bool histogram = false;
   bool log = false;
@@ -79,6 +83,7 @@ int main(int argc, char** argv)
   size_t nprocs = 1;
   reg_t start_pc = reg_t(-1);
   std::vector<std::pair<reg_t, mem_t*>> mems;
+  size_t tag_width = 2;
   std::unique_ptr<icache_sim_t> ic;
   std::unique_ptr<dcache_sim_t> dc;
   std::unique_ptr<cache_sim_t> l2;
@@ -105,10 +110,12 @@ int main(int argc, char** argv)
   parser.help(&help);
   parser.option('h', 0, 0, [&](const char* s){help();});
   parser.option('d', 0, 0, [&](const char* s){debug = true;});
+  parser.option('D', 0, 1, [&](const char* s){debug_level = atoi(s);});
   parser.option('g', 0, 0, [&](const char* s){histogram = true;});
   parser.option('l', 0, 0, [&](const char* s){log = true;});
   parser.option('p', 0, 1, [&](const char* s){nprocs = atoi(s);});
   parser.option('m', 0, 1, [&](const char* s){mems = make_mems(s);});
+  parser.option('t', 0, 1, [&](const char* s){tag_width = atoi(s);});
   // I wanted to use --halted, but for some reason that doesn't work.
   parser.option('H', 0, 0, [&](const char* s){halted = true;});
   parser.option(0, "rbb-port", 1, [&](const char* s){use_rbb = true; rbb_port = atoi(s);});
@@ -134,7 +141,7 @@ int main(int argc, char** argv)
   if (mems.empty())
     mems = make_mems("2048");
 
-  sim_t s(isa, nprocs, halted, start_pc, mems, htif_args, std::move(hartids),
+  sim_t s(isa, nprocs, halted, start_pc, mems, htif_args, tag_width, std::move(hartids),
       progsize);
   std::unique_ptr<remote_bitbang_t> remote_bitbang((remote_bitbang_t *) NULL);
   std::unique_ptr<jtag_dtm_t> jtag_dtm(new jtag_dtm_t(&s.debug_module));
@@ -161,6 +168,7 @@ int main(int argc, char** argv)
   }
 
   s.set_debug(debug);
+  debugprint_t::set_debuglevel(debug_level);
   s.set_log(log);
   s.set_histogram(histogram);
   return s.run();

@@ -12,6 +12,7 @@
 
 class processor_t;
 class mmu_t;
+class pmp_t;
 typedef reg_t (*insn_func_t)(processor_t*, insn_t, reg_t);
 class sim_t;
 class trap_t;
@@ -82,6 +83,11 @@ typedef struct
   bool load;
 } mcontrol_t;
 
+typedef enum {
+  S_NORMAL = 0,
+  S_SECURE = 1
+} security_type_t;
+
 // architectural state of a RISC-V hart
 struct state_t
 {
@@ -95,6 +101,7 @@ struct state_t
 
   // control and status registers
   reg_t prv;    // TODO: Can this be an enum instead?
+  security_type_t sec_level;
   reg_t mstatus;
   reg_t mepc;
   reg_t mtval;
@@ -111,7 +118,9 @@ struct state_t
   reg_t sepc;
   reg_t stval;
   reg_t sscratch;
+  reg_t stscratch;
   reg_t stvec;
+  reg_t sttvec;
   reg_t satp;
   reg_t scause;
   reg_t dpc;
@@ -162,7 +171,7 @@ static int cto(reg_t val)
 class processor_t : public abstract_device_t
 {
 public:
-  processor_t(const char* isa, sim_t* sim, uint32_t id, bool halt_on_reset=false);
+  processor_t(const char* isa, sim_t* sim, uint32_t id, size_t tag_width, bool halt_on_reset=false);
   ~processor_t();
 
   void set_debug(bool value);
@@ -172,6 +181,7 @@ public:
   void set_csr(int which, reg_t val);
   reg_t get_csr(int which);
   mmu_t* get_mmu() { return mmu; }
+  pmp_t* get_pmp() { return pmp; }
   state_t* get_state() { return &state; }
   unsigned get_xlen() { return xlen; }
   unsigned get_flen() {
@@ -188,9 +198,13 @@ public:
   void set_privilege(reg_t);
   void yield_load_reservation() { state.load_reservation = (reg_t)-1; }
   void update_histogram(reg_t pc);
+  void update_insnhistogram(insn_func_t func);
+  void clear_insnhistogram();
+  void print_insnhistogram();
+
   const disassembler_t* get_disassembler() { return disassembler; }
 
-  void register_insn(insn_desc_t);
+  void register_insn(insn_desc_t, const char*);
   void register_extension(extension_t*);
 
   // MMIO slave interface
@@ -289,12 +303,14 @@ public:
 private:
   sim_t* sim;
   mmu_t* mmu; // main memory is always accessed via the mmu
+  pmp_t* pmp;
   extension_t* ext;
   disassembler_t* disassembler;
   state_t state;
   uint32_t id;
   unsigned max_xlen;
   unsigned xlen;
+  unsigned tracing;
   reg_t isa;
   reg_t max_isa;
   std::string isa_string;
@@ -302,7 +318,9 @@ private:
   bool halt_on_reset;
 
   std::vector<insn_desc_t> instructions;
+  std::map<insn_func_t, const char*> insn_strings;
   std::map<reg_t,uint64_t> pc_histogram;
+  std::map<insn_func_t,uint64_t> insn_histogram;
 
   static const size_t OPCODE_CACHE_SIZE = 8191;
   insn_desc_t opcode_cache[OPCODE_CACHE_SIZE];
@@ -317,6 +335,8 @@ private:
 
   friend class sim_t;
   friend class mmu_t;
+  friend class pmp_t;
+  friend class tag_t;
   friend class clint_t;
   friend class extension_t;
 
@@ -324,16 +344,19 @@ private:
   void build_opcode_map();
   void register_base_instructions();
   insn_func_t decode_insn(insn_t insn);
+  void set_pmp_entry(int which, reg_t val);
+  reg_t get_pmp_entry(int which);
 
   // Track repeated executions for processor_t::disasm()
   uint64_t last_pc, last_bits, executions;
 };
 
 reg_t illegal_instruction(processor_t* p, insn_t insn, reg_t pc);
+reg_t dummy_stall(processor_t* p, insn_t insn, reg_t pc);
 
 #define REGISTER_INSN(proc, name, match, mask) \
   extern reg_t rv32_##name(processor_t*, insn_t, reg_t); \
   extern reg_t rv64_##name(processor_t*, insn_t, reg_t); \
-  proc->register_insn((insn_desc_t){match, mask, rv32_##name, rv64_##name});
+  proc->register_insn((insn_desc_t){match, mask, rv32_##name, rv64_##name}, #name);
 
 #endif

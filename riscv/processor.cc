@@ -6,6 +6,9 @@
 #include "config.h"
 #include "sim.h"
 #include "mmu.h"
+#include "tag.h"
+#include "pmp.h"
+#include "debugprint.h"
 #include "disasm.h"
 #include <cinttypes>
 #include <cmath>
@@ -20,14 +23,15 @@
 #define STATE state
 
 processor_t::processor_t(const char* isa, sim_t* sim, uint32_t id,
-        bool halt_on_reset)
+        size_t tag_width, bool halt_on_reset)
   : debug(false), halt_request(false), sim(sim), ext(NULL), id(id),
   halt_on_reset(halt_on_reset), last_pc(1), executions(1)
 {
   parse_isa_string(isa);
   register_base_instructions();
 
-  mmu = new mmu_t(sim, this);
+  mmu = new mmu_t(sim, this, tag_width);
+  pmp = new pmp_t(sim, this);
   disassembler = new disassembler_t(max_xlen);
 
   reset();
@@ -45,6 +49,7 @@ processor_t::~processor_t()
 #endif
 
   delete mmu;
+  delete pmp;
   delete disassembler;
 }
 
@@ -119,6 +124,7 @@ void state_t::reset()
 {
   memset(this, 0, sizeof(*this));
   prv = PRV_M;
+  sec_level = S_NORMAL;
   pc = DEFAULT_RSTVEC;
   load_reservation = -1;
   tselect = 0;
@@ -153,6 +159,13 @@ void processor_t::reset()
 
   if (ext)
     ext->reset(); // reset the extension
+
+  if (mmu) {
+    mmu->reset();
+  }
+  if (pmp) {
+    pmp->reset();
+  }
 }
 
 // Count number of contiguous 0 bits starting from the LSB.
@@ -261,15 +274,26 @@ void processor_t::take_trap(trap_t& t, reg_t epc)
     return;
   }
 
+  // Block enclave from resuming
+  pmp->notify_interrupt();
+
   // by default, trap to M-mode, unless delegated to S-mode
   reg_t bit = t.cause();
   reg_t deleg = state.medeleg;
   bool interrupt = (bit & ((reg_t)1 << (max_xlen-1))) != 0;
   if (interrupt)
     deleg = state.mideleg, bit &= ~((reg_t)1 << (max_xlen-1));
+  debug_info("Exception: deleg: %lx, bit: %lx\n", deleg, bit);
   if (state.prv <= PRV_S && bit < max_xlen && ((deleg >> bit) & 1)) {
+    debug_info("Supervisor exception\n");
     // handle the trap in S-mode
-    state.pc = state.stvec;
+    if (state.sec_level == S_SECURE) {
+      debug_info("Supervisor secure exception\n");
+      state.pc = state.sttvec;
+    } else {
+      debug_info("Supervisor normal exception\n");
+      state.pc = state.stvec;
+    }
     state.scause = t.cause();
     state.sepc = epc;
     state.stval = t.get_tval();
@@ -281,6 +305,7 @@ void processor_t::take_trap(trap_t& t, reg_t epc)
     set_csr(CSR_MSTATUS, s);
     set_privilege(PRV_S);
   } else {
+    debug_info("Machine exception\n");
     reg_t vector = (state.mtvec & 1) && interrupt ? 4*bit : 0;
     state.pc = (state.mtvec & ~(reg_t)1) + vector;
     state.mepc = epc;
@@ -341,6 +366,23 @@ void processor_t::set_csr(int which, reg_t val)
       dirty_fp_state;
       state.fflags = (val & FSR_AEXC) >> FSR_AEXC_SHIFT;
       state.frm = (val & FSR_RD) >> FSR_RD_SHIFT;
+      break;
+    case CSR_TRACE:
+      debug_warn("TRACE: %d\n", val);
+      if (val == 1) {
+          debug_warn("Start tracing @ %p\n", state.pc);
+          tracing = 1;
+          clear_insnhistogram();
+      } else if (val == 2) {
+        if (tracing) {
+          debug_warn("Stop tracing @ %p\n", state.pc);
+          print_insnhistogram();
+          tracing = 0;
+          exit(0);
+        }
+      } else {
+        throw trap_illegal_instruction(0);
+      }
       break;
     case CSR_MSTATUS: {
       if ((val ^ state.mstatus) &
@@ -437,7 +479,21 @@ void processor_t::set_csr(int which, reg_t val)
     }
     case CSR_SEPC: state.sepc = val; break;
     case CSR_STVEC: state.stvec = val >> 2 << 2; break;
+    case CSR_STTVEC: {
+      if (state.prv == PRV_S && state.sec_level != S_SECURE) {
+        throw trap_illegal_instruction(0);
+      }
+      state.sttvec = val >> 2 << 2;
+      break;
+    }
     case CSR_SSCRATCH: state.sscratch = val; break;
+    case CSR_STSCRATCH: {
+      if (state.prv == PRV_S && state.sec_level != S_SECURE) {
+        throw trap_illegal_instruction(0);
+      }
+      state.stscratch = val;
+      break;
+    }
     case CSR_SCAUSE: state.scause = val; break;
     case CSR_STVAL: state.stval = val; break;
     case CSR_MEPC: state.mepc = val; break;
@@ -515,6 +571,121 @@ void processor_t::set_csr(int which, reg_t val)
     case CSR_DSCRATCH:
       state.dscratch = val;
       break;
+    case CSR_MPMPBASE0:
+    case CSR_MPMPBOUND0:
+    case CSR_MPMPFLAGS0:
+    case CSR_MPMPBASE1:
+    case CSR_MPMPBOUND1:
+    case CSR_MPMPFLAGS1:
+    case CSR_MPMPBASE2:
+    case CSR_MPMPBOUND2:
+    case CSR_MPMPFLAGS2:
+    case CSR_MPMPBASE3:
+    case CSR_MPMPBOUND3:
+    case CSR_MPMPFLAGS3:
+    case CSR_MPMPBASE4:
+    case CSR_MPMPBOUND4:
+    case CSR_MPMPFLAGS4:
+    case CSR_MPMPBASE5:
+    case CSR_MPMPBOUND5:
+    case CSR_MPMPFLAGS5:
+    case CSR_MPMPBASE6:
+    case CSR_MPMPBOUND6:
+    case CSR_MPMPFLAGS6:
+    case CSR_MPMPBASE7:
+    case CSR_MPMPBOUND7:
+    case CSR_MPMPFLAGS7:
+    case CSR_SPMPBASE0:
+    case CSR_SPMPBOUND0:
+    case CSR_SPMPFLAGS0:
+    case CSR_SPMPBASE1:
+    case CSR_SPMPBOUND1:
+    case CSR_SPMPFLAGS1:
+    case CSR_SPMPBASE2:
+    case CSR_SPMPBOUND2:
+    case CSR_SPMPFLAGS2:
+    case CSR_SPMPBASE3:
+    case CSR_SPMPBOUND3:
+    case CSR_SPMPFLAGS3:
+    case CSR_SPMPBASE4:
+    case CSR_SPMPBOUND4:
+    case CSR_SPMPFLAGS4:
+    case CSR_SPMPBASE5:
+    case CSR_SPMPBOUND5:
+    case CSR_SPMPFLAGS5:
+    case CSR_SPMPBASE6:
+    case CSR_SPMPBOUND6:
+    case CSR_SPMPFLAGS6:
+    case CSR_SPMPBASE7:
+    case CSR_SPMPBOUND7:
+    case CSR_SPMPFLAGS7:
+      set_pmp_entry(which, val);
+      break;
+    case CSR_STTCB:
+      if (state.prv == PRV_S && state.sec_level != S_SECURE) {
+        throw trap_illegal_instruction(0);
+      }
+      /* fall-thru */
+    case CSR_MTTCB:
+      pmp->update_ttcb(val);
+      break;
+    case CSR_STSTATUS:
+      if (state.prv == PRV_S && state.sec_level != S_SECURE) {
+        debug_warn("cannot set STSTATUS from SN mode @ %p\n", (void*)state.pc);
+        throw trap_illegal_instruction(0);
+      }
+      /* fall-thru */
+    case CSR_MTSTATUS:
+      pmp->set_mtstatus(val);
+      break;
+  }
+}
+
+void processor_t::set_pmp_entry(int which, reg_t val)
+{
+  unsigned int index = (which & 0x003C) >> 2;
+  which &= ~(0x003C); /* delete index */
+  pmp_entry_t *entry = pmp->get_entry(index);
+  assert(entry);
+  pmp_entry_t new_entry = *entry; /* clone current entry since we only change parts of it */
+  switch (which) {
+    case CSR_MPMPBASE0:
+    case CSR_SPMPBASE0:
+      new_entry.base = val;
+      break;
+    case CSR_MPMPBOUND0:
+    case CSR_SPMPBOUND0:
+      new_entry.bound = val;
+      break;
+    case CSR_MPMPFLAGS0:
+    case CSR_SPMPFLAGS0:
+      new_entry.flags.raw = val;
+      break;
+    default:
+      assert(false);
+  }
+  pmp->set_entry(index, new_entry);
+}
+
+reg_t processor_t::get_pmp_entry(int which)
+{
+  unsigned int index = (which & 0x003C) >> 2;
+  which &= ~(0x003C); /* delete index */
+  pmp_entry_t *entry = pmp->get_entry(index);
+  assert(entry);
+  switch (which) {
+    case CSR_MPMPBASE0:
+    case CSR_SPMPBASE0:
+      return entry->base;
+    case CSR_MPMPBOUND0:
+    case CSR_SPMPBOUND0:
+      return entry->bound;
+    case CSR_MPMPFLAGS0:
+    case CSR_SPMPFLAGS0:
+      return entry->flags.raw;
+    default:
+      debug_warn("Invalid entry. which: %x\n", which);
+      assert(false);
   }
 }
 
@@ -557,6 +728,8 @@ reg_t processor_t::get_csr(int which)
       if (!supports_extension('F'))
         break;
       return (state.fflags << FSR_AEXC_SHIFT) | (state.frm << FSR_RD_SHIFT);
+    case CSR_TRACE:
+      return 0;
     case CSR_INSTRET:
     case CSR_CYCLE:
       if (ctr_ok)
@@ -586,6 +759,11 @@ reg_t processor_t::get_csr(int which)
     case CSR_SEPC: return state.sepc;
     case CSR_STVAL: return state.stval;
     case CSR_STVEC: return state.stvec;
+    case CSR_STTVEC: 
+      if (state.prv == PRV_S && state.sec_level != S_SECURE) {
+        throw trap_illegal_instruction(0);
+      }
+      return state.sttvec;
     case CSR_SCAUSE:
       if (max_xlen > xlen)
         return state.scause | ((state.scause >> (max_xlen-1)) << (xlen-1));
@@ -595,6 +773,12 @@ reg_t processor_t::get_csr(int which)
         require_privilege(PRV_M);
       return state.satp;
     case CSR_SSCRATCH: return state.sscratch;
+    case CSR_STSCRATCH: {
+      if (state.prv == PRV_S && state.sec_level != S_SECURE) {
+        throw trap_illegal_instruction(0);
+      }
+      return state.stscratch;
+    }
     case CSR_MSTATUS: return state.mstatus;
     case CSR_MIP: return state.mip;
     case CSR_MIE: return state.mie;
@@ -662,11 +846,71 @@ reg_t processor_t::get_csr(int which)
       return state.dpc;
     case CSR_DSCRATCH:
       return state.dscratch;
+    case CSR_MPMPBASE0:
+    case CSR_MPMPBOUND0:
+    case CSR_MPMPFLAGS0:
+    case CSR_MPMPBASE1:
+    case CSR_MPMPBOUND1:
+    case CSR_MPMPFLAGS1:
+    case CSR_MPMPBASE2:
+    case CSR_MPMPBOUND2:
+    case CSR_MPMPFLAGS2:
+    case CSR_MPMPBASE3:
+    case CSR_MPMPBOUND3:
+    case CSR_MPMPFLAGS3:
+    case CSR_MPMPBASE4:
+    case CSR_MPMPBOUND4:
+    case CSR_MPMPFLAGS4:
+    case CSR_MPMPBASE5:
+    case CSR_MPMPBOUND5:
+    case CSR_MPMPFLAGS5:
+    case CSR_MPMPBASE6:
+    case CSR_MPMPBOUND6:
+    case CSR_MPMPFLAGS6:
+    case CSR_MPMPBASE7:
+    case CSR_MPMPBOUND7:
+    case CSR_MPMPFLAGS7:
+    case CSR_SPMPBASE0:
+    case CSR_SPMPBOUND0:
+    case CSR_SPMPFLAGS0:
+    case CSR_SPMPBASE1:
+    case CSR_SPMPBOUND1:
+    case CSR_SPMPFLAGS1:
+    case CSR_SPMPBASE2:
+    case CSR_SPMPBOUND2:
+    case CSR_SPMPFLAGS2:
+    case CSR_SPMPBASE3:
+    case CSR_SPMPBOUND3:
+    case CSR_SPMPFLAGS3:
+    case CSR_SPMPBASE4:
+    case CSR_SPMPBOUND4:
+    case CSR_SPMPFLAGS4:
+    case CSR_SPMPBASE5:
+    case CSR_SPMPBOUND5:
+    case CSR_SPMPFLAGS5:
+    case CSR_SPMPBASE6:
+    case CSR_SPMPBOUND6:
+    case CSR_SPMPFLAGS6:
+    case CSR_SPMPBASE7:
+    case CSR_SPMPBOUND7:
+    case CSR_SPMPFLAGS7:
+      return get_pmp_entry(which);
+    case CSR_MTTCB:
+    case CSR_STTCB:
+      return pmp->current_ttcb_ptr;
+    case CSR_MTSTATUS:
+    case CSR_STSTATUS:
+        return pmp->get_mtstatus();
   }
   throw trap_illegal_instruction(0);
 }
 
 reg_t illegal_instruction(processor_t* p, insn_t insn, reg_t pc)
+{
+  throw trap_illegal_instruction(0);
+}
+
+reg_t dummy_stall(processor_t* p, insn_t insn, reg_t pc)
 {
   throw trap_illegal_instruction(0);
 }
@@ -690,6 +934,7 @@ insn_func_t processor_t::decode_insn(insn_t insn)
         while (--p >= &instructions[0])
           *(p+1) = *p;
         instructions[0] = desc;
+
       }
     }
 
@@ -700,9 +945,11 @@ insn_func_t processor_t::decode_insn(insn_t insn)
   return xlen == 64 ? desc.rv64 : desc.rv32;
 }
 
-void processor_t::register_insn(insn_desc_t desc)
+void processor_t::register_insn(insn_desc_t desc, const char* str)
 {
   instructions.push_back(desc);
+  insn_strings[desc.rv32] = str;
+  insn_strings[desc.rv64] = str;
 }
 
 void processor_t::build_opcode_map()
@@ -723,7 +970,7 @@ void processor_t::build_opcode_map()
 void processor_t::register_extension(extension_t* x)
 {
   for (auto insn : x->get_instructions())
-    register_insn(insn);
+    register_insn(insn, "EXTENSION");
   build_opcode_map();
   for (auto disasm_insn : x->get_disasms())
     disassembler->add_insn(disasm_insn);
@@ -745,7 +992,8 @@ void processor_t::register_base_instructions()
   #include "insn_list.h"
   #undef DEFINE_INSN
 
-  register_insn({0, 0, &illegal_instruction, &illegal_instruction});
+  register_insn({0, 0, &illegal_instruction, &illegal_instruction}, "ILLEGAL");
+  register_insn({0, 0, &dummy_stall, &dummy_stall}, "stall");
   build_opcode_map();
 }
 

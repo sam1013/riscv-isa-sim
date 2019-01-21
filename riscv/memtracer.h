@@ -8,9 +8,9 @@
 #include <vector>
 
 enum access_type {
-  LOAD,
-  STORE,
-  FETCH,
+  LOAD=0,
+  STORE=1,
+  FETCH=2,
 };
 
 class memtracer_t

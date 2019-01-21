@@ -11,6 +11,7 @@
 # error spike requires a little-endian host
 #endif
 
+#include "debugprint.h"
 #include <cstdint>
 #include <string.h>
 #include <strings.h>
@@ -71,7 +72,12 @@ public:
   insn_bits_t bits() { return b; }
   int length() { return insn_length(b); }
   int64_t i_imm() { return int64_t(b) >> 20; }
+  int64_t it_imm() { return xs(20, 10); }
+  uint64_t it_etag() { return x(30, 2); }
   int64_t s_imm() { return x(7, 5) + (xs(25, 7) << 5); }
+  int64_t st_imm() { return x(7, 5) + (xs(25, 3) << 5); }
+  uint64_t st_ntag() { return x(28, 2); }
+  uint64_t st_etag() { return x(30, 2); }
   int64_t sb_imm() { return (x(8, 4) << 1) + (x(25,6) << 5) + (x(7,1) << 11) + (imm_sign() << 12); }
   int64_t u_imm() { return int64_t(b) >> 12 << 12; }
   int64_t uj_imm() { return (x(21, 10) << 1) + (x(20, 1) << 11) + (x(12, 8) << 12) + (imm_sign() << 20); }
@@ -126,6 +132,7 @@ private:
 
 // helpful macros, etc
 #define MMU (*p->get_mmu())
+#define TAG (*MMU.get_tag())
 #define STATE (*p->get_state())
 #define READ_REG(reg) STATE.XPR[reg]
 #define READ_FREG(reg) STATE.FPR[reg]
@@ -148,6 +155,14 @@ private:
     DO_WRITE_FREG(reg, wdata); \
   })
 #endif
+
+#define REQUIRE_TAG(addr, require_tag) ({ \
+    debug_verbose("REQUIRE_TAG @ %p accessing %p. Required %lu, got %lu\n", (void*)pc, addr, require_tag, TAG.load_tag((addr))); \
+    if (TAG.load_tag((addr)) != (require_tag)) { \
+      debug_warn("Invalid tag on checked load/store @ %p accessing %p. Required %lu, got %lu\n", (void*)pc, addr, require_tag, TAG.load_tag((addr))); \
+      throw trap_tag_mismatch((addr)); \
+    } \
+  })
 
 // RVC macros
 #define WRITE_RVC_RS1S(value) WRITE_REG(insn.rvc_rs1s(), value)
@@ -201,6 +216,16 @@ private:
 #define zext_xlen(x) (((reg_t)(x) << (64-xlen)) >> (64-xlen))
 
 #define set_pc(x) \
+  do { p->update_insnhistogram(&dummy_stall); \
+       if (unlikely(((x) & 2)) && !p->supports_extension('C')) \
+         throw trap_instruction_address_misaligned(x); \
+       npc = sext_xlen(x); \
+     } while(0)
+
+/* Use whenever branch target can be statically computed, i.e. 
+ * prefetcher can precompute it
+ */
+#define set_pc_direct(x) \
   do { if (unlikely(((x) & 2)) && !p->supports_extension('C')) \
          throw trap_instruction_address_misaligned(x); \
        npc = sext_xlen(x); \

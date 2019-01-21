@@ -70,12 +70,36 @@ inline void processor_t::update_histogram(reg_t pc)
 #endif
 }
 
+void processor_t::update_insnhistogram(insn_func_t func)
+{
+#ifdef RISCV_ENABLE_HISTOGRAM
+  insn_histogram[func]++;
+#endif
+}
+
+void processor_t::clear_insnhistogram()
+{
+#ifdef RISCV_ENABLE_HISTOGRAM
+  insn_histogram.clear();
+#endif
+}
+
+void processor_t::print_insnhistogram()
+{
+#ifdef RISCV_ENABLE_HISTOGRAM
+  fprintf(stderr, "INSN Histogram size:%zu\n", insn_histogram.size());
+  for (auto it : insn_histogram)
+    fprintf(stderr, "[HIST] %s %"PRIu64"\n", insn_strings[it.first], it.second);
+#endif
+}
+
 // This is expected to be inlined by the compiler so each use of execute_insn
 // includes a duplicated body of the function to get separate fetch.func
 // function calls.
 static reg_t execute_insn(processor_t* p, reg_t pc, insn_fetch_t fetch)
 {
   commit_log_stash_privilege(p);
+  p->update_insnhistogram(fetch.func);
   reg_t npc = fetch.func(p, fetch.insn, pc);
   if (!invalid_pc(npc)) {
     commit_log_print_insn(p->get_state(), pc, fetch.insn);
@@ -86,7 +110,9 @@ static reg_t execute_insn(processor_t* p, reg_t pc, insn_fetch_t fetch)
 
 bool processor_t::slow_path()
 {
-  return debug || state.single_step != state.STEP_NONE || state.dcsr.cause;
+  //return debug || state.single_step != state.STEP_NONE || state.dcsr.cause;
+  /* disable icache */
+  return true;
 }
 
 // fetch/decode/execute loop

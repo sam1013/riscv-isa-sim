@@ -12,6 +12,9 @@ riscv_hdrs = \
 	devices.h \
 	disasm.h \
 	mmu.h \
+	pmp.h \
+	tag.h \
+	debugprint.h \
 	processor.h \
 	sim.h \
 	trap.h \
@@ -38,6 +41,9 @@ riscv_srcs = \
 	trap.cc \
 	cachesim.cc \
 	mmu.cc \
+	pmp.cc \
+	tag.cc \
+	debugprint.cc \
 	disasm.cc \
 	extension.cc \
 	extensions.cc \
@@ -236,15 +242,24 @@ riscv_insn_list = \
 	jal \
 	jalr \
 	lb \
+	lbct \
 	lbu \
+	lbuct \
 	ld \
+	ldct \
 	lh \
+	lhct \
 	lhu \
+	lhuct \
 	lr_d \
 	lr_w \
+	ltag \
 	lui \
 	lw \
+	lwct \
 	lwu \
+	lwuct \
+	ltt \
 	mret \
 	mul \
 	mulh \
@@ -258,11 +273,14 @@ riscv_insn_list = \
 	remuw \
 	remw \
 	sb \
+	sbct \
 	sc_d \
 	sc_w \
 	sd \
+	sdct \
 	sfence_vma \
 	sh \
+	shct \
 	sll \
 	slli \
 	slliw \
@@ -280,9 +298,11 @@ riscv_insn_list = \
 	srli \
 	srliw \
 	srlw \
+	stag \
 	sub \
 	subw \
 	sw \
+	swct \
 	wfi \
 	xor \
 	xori \
