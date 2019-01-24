@@ -1,16 +1,18 @@
 RISC-V ISA Simulator
 ======================
 
-Author  : Andrew Waterman, Yunsup Lee
+This is a subproject of [TIMBER-V Toolchain][timberv-riscv-tools].
 
-Date    : June 19, 2011
+Author  : Andrew Waterman, Yunsup Lee, Samuel Weiser
+
+Date    : Jan 24, 2019
 
 Version : (under version control)
 
 About
 -------------
 
-The RISC-V ISA Simulator implements a functional model of one or more
+The TIMBER-V ISA Simulator implements a functional model of one or more
 RISC-V processors.
 
 Build Steps
@@ -224,3 +226,5 @@ $4 = 0
 (gdb) print text
 ...
 ```
+
+[timberv-riscv-tools]: https://github.com/sam1013/timberv-riscv-tools/tree/timberv
